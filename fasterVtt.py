@@ -1,53 +1,104 @@
 import os
-import re
 import sys
 import subprocess
+import re
+import time
 from datetime import datetime
-import shutil
+import openai
 from faster_whisper import WhisperModel
+from tqdm import tqdm  # Import progress bar library
+import shlex
 
 # ─────────────────────────────────────────────
 # ✅ Fix OpenMP DLL Conflicts
 # ─────────────────────────────────────────────
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"  # Prevent OpenMP conflicts
-os.add_dll_directory("C:\\Users\\cwshe\\anaconda3\\Library\\bin")  # Force correct DLL
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.add_dll_directory("C:\\Users\\cwshe\\anaconda3\\Library\\bin")
+os.environ["PATH"] = ";".join(
+    [p for p in os.environ["PATH"].split(";") if "CloudComPy310" not in p]
+)
 
 # ─────────────────────────────────────────────
-# ✅ Load OpenAI API Key (If Needed in Future)
+# ✅ Fetch OpenAI API Key
 # ─────────────────────────────────────────────
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise ValueError("❌ ERROR: OpenAI API key not found. Please set the 'OPENAI_API_KEY' environment variable.")
+openai.api_key = os.getenv("OPENAI_API_KEY")
+if not openai.api_key:
+    print("❌ ERROR: OpenAI API key is missing.")
+    exit(1)
+
+# ✅ Fetch available OpenAI models
+try:
+    models = openai.models.list()
+    available_models = [model.id for model in models.data]
+except openai.OpenAIError as e:
+    print("❌ ERROR: Failed to fetch OpenAI models.", e)
+    exit(1)
+
+# ✅ Pick the best available model
+preferred_models = ["gpt-4o", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo"]
+selected_model = next((m for m in preferred_models if m in available_models), "gpt-3.5-turbo")
+print(f"✅ Using OpenAI model: {selected_model}")
 
 # ─────────────────────────────────────────────
 # ✅ Helper Functions
 # ─────────────────────────────────────────────
 def now():
-    """Returns the current timestamp for logging."""
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def check_ffmpeg():
-    """Ensure FFmpeg is installed and accessible."""
-    if not shutil.which("c:\\ffmpeg\\bin\\ffmpeg"):
-        raise FileNotFoundError("❌ ERROR: FFmpeg not found at expected location.")
+def get_audio_duration(file_path):
+    result = subprocess.run(
+        f'c:\\ffmpeg\\bin\\ffprobe -i "{file_path}" -show_entries format=duration -v quiet -of csv="p=0"',
+        shell=True, capture_output=True, text=True
+    )
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        return None
 
-def run_command_live_output(command):
-    """Runs a shell command and displays real-time output."""
-    print(f"{now()} ⏳ Running: {command}")
 
+
+def run_ffmpeg_with_progress(command, input_file=None):
+    """Runs FFmpeg with progress tracking and estimated time to completion."""
+    print(f"{now()} ⏳ Running FFmpeg: {command}")
+
+    total_duration = get_audio_duration(input_file) if input_file else None
+
+    # Force FFmpeg to run correctly with `shell=True`
+    process = subprocess.Popen(
+        command + " -progress pipe:1 -v error",
+        shell=True,  # Required for Windows
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
+    progress_bar = None
+    if total_duration:
+        progress_bar = tqdm(total=total_duration, unit="s", desc="🔄 FFmpeg Processing", dynamic_ncols=True)
+
+    for line in process.stdout:
+        match = re.search(r'out_time_ms=(\d+)', line)
+        if match:
+            elapsed_time = int(match.group(1)) / 1_000_000  # Convert microseconds to seconds
+            if progress_bar:
+                progress_bar.update(elapsed_time - progress_bar.n)
+
+    if progress_bar:
+        progress_bar.close()
+
+    process.wait()  # Ensure it fully completes before returning
+    return process.returncode
+
+def run_ffmpeg(command):
+    """Runs an FFmpeg command and shows real-time output."""
     process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     for line in process.stdout:
-        print(f"{now()} ▶ {line.strip()}")  # Print real-time output
+        print(f"{now()} ▶ {line.strip()}")
 
     process.wait()
-
-    if process.returncode == 0:
-        print(f"{now()} ✅ Command completed successfully.")
-    else:
-        print(f"{now()} ❌ Error running command.")
+    return process.returncode
 
 def clean_up(file):
-    """Deletes a file if it exists."""
     if os.path.exists(file):
         print(f"{now()} 🗑️ Deleting {file}...")
         os.remove(file)
@@ -65,78 +116,165 @@ cleaned_vtt_file = os.path.join(path, f"{base_name}_fixed.vtt")
 zh_vtt_file = os.path.join(path, f"{base_name}_zh.vtt")
 srt_output_file = os.path.join(path, f"{base_name}.srt")
 video_output_file = os.path.join(path, f"{base_name}_subtitled.mp4")
-small_video_output_file = os.path.join(path, f"{base_name}_small.mp4")
+small_video_output_file = os.path.join(path, f"{base_name}_wechat.mp4")
+
+
+# ✅ Step 1: Extract Audio from Video (With Progress)
+if not os.path.exists(audio_file):
+    print(f"{now()} 🎙️ Extracting audio from video...")
+    run_ffmpeg_with_progress(f'"c:\\ffmpeg\\bin\\ffmpeg" -hwaccel cuda -y -nostdin -i "{video_input_file}" -ar 16000 -ac 1 -c:a pcm_s16le "{audio_file}"', video_input_file)
 
 # ─────────────────────────────────────────────
-# ✅ Define Command Dictionary (For Debugging)
+# ✅ Step 2: Run Faster-Whisper for Transcription (Only if Needed)
 # ─────────────────────────────────────────────
-COMMANDS = {
-    "extract_audio": f'c:\\ffmpeg\\bin\\ffmpeg -hwaccel cuda -y -nostdin -i "{video_input_file}" -ar 16000 -ac 1 -c:a pcm_s16le "{audio_file}"',
-    "convert_vtt_to_srt": f'c:\\ffmpeg\\bin\\ffmpeg -y -nostdin -i "{zh_vtt_file}" "{srt_output_file}"',
-    "embed_subtitles": f'c:\\ffmpeg\\bin\\ffmpeg -hwaccel cuda -y -nostdin -i "{video_input_file}" -vf "subtitles={srt_output_file}" "{video_output_file}"',
-    "optimize_video": f'c:\\ffmpeg\\bin\\ffmpeg -hwaccel cuda -y -nostdin -i "{video_output_file}" -vf scale=960:540 -c:v h264_nvenc -crf 23 -preset fast -b:v 1000k -c:a aac -b:a 128k "{small_video_output_file}"'
-}
+if not os.path.exists(whisper_output_vtt):
+    print(f"{now()} 📝 Running Faster Whisper transcription...")
+
+    model = WhisperModel("large", device="cuda", compute_type="float16")
+
+    # Get total audio duration for progress tracking
+    duration_command = f'c:\\ffmpeg\\bin\\ffprobe -i "{audio_file}" -show_entries format=duration -v quiet -of csv="p=0"'
+    try:
+        total_duration = float(subprocess.run(duration_command, shell=True, capture_output=True, text=True).stdout.strip())
+    except ValueError:
+        total_duration = None
+
+    # Transcribe and display progress
+    segments, _ = model.transcribe(audio_file)
+
+    with open(whisper_output_vtt, "w", encoding="utf-8") as f:
+        f.write("WEBVTT\n\n")
+
+        with tqdm(total=total_duration, unit="s", desc="🎙️ Transcribing", dynamic_ncols=True) as pbar:
+            for segment in segments:
+                f.write(f"{segment.start:.3f} --> {segment.end:.3f}\n{segment.text.strip()}\n\n")
+                if total_duration:
+                    pbar.update(segment.end - segment.start)  # Update progress bar
+
+    print(f"{now()} ✅ Transcription saved: {whisper_output_vtt}")
+else:
+    print(f"{now()} ⏩ Skipping transcription, file exists: {whisper_output_vtt}")
+
 
 # ─────────────────────────────────────────────
-# ✅ Debug: Print Commands Before Execution
+# ✅ Step 3: Fix Grammar & Create _fixed.vtt (With Progress Bar)
 # ─────────────────────────────────────────────
-print("\n🔹 Debugging COMMANDS dictionary...\n")
-for call_name, command_string in COMMANDS.items():
-    print(f"{now()} COMMAND: {call_name}\n{command_string}\n")
+def fix_grammar_vtt(input_vtt, output_vtt):
+    if os.path.exists(output_vtt):
+        print(f"{now()} ⏩ Skipping grammar fix: {output_vtt} already exists.")
+        return
+
+    print(f"{now()} ✨ Fixing grammar in {input_vtt}...")
+
+    with open(input_vtt, "r", encoding="utf-8") as infile:
+        transcript = infile.read()
+
+    sections = transcript.strip().split("\n\n")
+    total_sections = len(sections)
+
+    with tqdm(total=total_sections, unit="block", desc="🔄 Grammar Fixing", dynamic_ncols=True) as pbar:
+        fixed_sections = []
+        
+        for section in sections:
+            response = openai.chat.completions.create(
+                model=selected_model,
+                messages=[{"role": "system", "content": "Fix grammar and improve readability while keeping timestamps intact."},
+                          {"role": "user", "content": section}],
+                temperature=0.3
+            )
+            fixed_sections.append(response.choices[0].message.content)
+            pbar.update(1)
+
+    with open(output_vtt, "w", encoding="utf-8") as outfile:
+        outfile.write("\n\n".join(fixed_sections))
+
+    print(f"{now()} ✅ Grammar fixed and saved to {output_vtt}")
+
+fix_grammar_vtt(whisper_output_vtt, cleaned_vtt_file)
 
 # ─────────────────────────────────────────────
-# ✅ Cleanup Previous Files
+# ✅ Step 4: Translate to Chinese (_zh.vtt)
 # ─────────────────────────────────────────────
-clean_up(audio_file)
-clean_up(whisper_output_vtt)
-clean_up(cleaned_vtt_file)
-clean_up(zh_vtt_file)
-clean_up(srt_output_file)
-clean_up(video_output_file)
-clean_up(small_video_output_file)
+def translate_vtt(input_vtt, output_vtt):
+    if os.path.exists(output_vtt):
+        print(f"{now()} ⏩ Skipping translation: {output_vtt} already exists.")
+        return
 
-print(f"{now()} 🔹 Processing Started for Video: {video_input_file}")
+    print(f"{now()} 🌎 Translating {input_vtt} to Chinese...")
 
-check_ffmpeg()  # Ensure FFmpeg is installed
+    with open(input_vtt, "r", encoding="utf-8") as infile:
+        transcript = infile.read()
 
-# ─────────────────────────────────────────────
-# ✅ Step 1: Extract Audio from Video
-# ─────────────────────────────────────────────
-print(f"{now()} 🎙️ Extracting audio from video using FFmpeg with CUDA...")
-run_command_live_output(COMMANDS["extract_audio"])
+    response = openai.chat.completions.create(
+        model=selected_model,
+        messages=[{"role": "system", "content": "Translate this subtitle file into Simplified Chinese while keeping timestamps intact."},
+                  {"role": "user", "content": transcript}],
+        temperature=0.3
+    )
 
-# ─────────────────────────────────────────────
-# ✅ Step 2: Run Faster-Whisper (Transcription)
-# ─────────────────────────────────────────────
-print(f"{now()} 📝 Running Faster Whisper for transcription...")
+    with open(output_vtt, "w", encoding="utf-8") as outfile:
+        outfile.write(response.choices[0].message.content)
 
-model = WhisperModel("large", device="cuda", compute_type="float16")
+    print(f"{now()} ✅ Translation saved to {output_vtt}")
 
-segments, _ = model.transcribe(audio_file)
+translate_vtt(cleaned_vtt_file, zh_vtt_file)
 
-with open(whisper_output_vtt, "w", encoding="utf-8") as f:
-    f.write("WEBVTT\n\n")
-    for segment in segments:
-        f.write(f"{segment.start:.3f} --> {segment.end:.3f}\n{segment.text.strip()}\n\n")
+# ✅ Step 5: Convert VTT to SRT
+if os.path.exists(zh_vtt_file) and os.path.getsize(zh_vtt_file) > 0:
+    print(f"{now()} 🎞️ Converting VTT to SRT using FFmpeg...")
+    ffmpeg_cmd = f'"c:\\ffmpeg\\bin\\ffmpeg" -y -i "{zh_vtt_file}" "{srt_output_file}"'
+    
+    # Debugging Log: Show exactly what command is being run
+    print(f"🔹 Running: {ffmpeg_cmd}")
 
-print(f"{now()} ✅ Transcription saved to {whisper_output_vtt}")
+    result = run_ffmpeg_with_progress(ffmpeg_cmd)
 
-# ─────────────────────────────────────────────
-# ✅ Step 3: Convert VTT to SRT
-# ─────────────────────────────────────────────
-print(f"{now()} 🔄 Converting VTT to SRT...")
-run_command_live_output(COMMANDS["convert_vtt_to_srt"])
+    if result == 0:
+        print(f"{now()} ✅ Successfully converted {zh_vtt_file} to {srt_output_file}")
+    else:
+        print(f"{now()} ❌ FFmpeg failed with error code {result}")
+else:
+    print(f"{now()} ❌ Skipping Step 5: VTT file missing or empty: {zh_vtt_file}")
 
-# ─────────────────────────────────────────────
-# ✅ Step 4: Embed Subtitles into the Video
-# ─────────────────────────────────────────────
-print(f"{now()} 🔄 Embedding subtitles into the video...")
-run_command_live_output(COMMANDS["embed_subtitles"])
+# 🔄 Step 6: Burn Subtitles into Video with Progress
+if not os.path.exists(video_output_file):
+    print(f"\n\n{now()}: adding subtitles to {video_input_file}\n")
 
-# ─────────────────────────────────────────────
-# ✅ Step 5: Optimize Video for WeChat
-# ─────────────────────────────────────────────
-print(f"{now()} 🔄 Optimizing video size for WeChat...")
-run_command_live_output(COMMANDS["optimize_video"])
+    # Format path for FFmpeg compatibility
+    new_srt_outputFileName = srt_output_file.replace("\\", "\\\\").replace(":", "\\:")
+
+    ffmpeg_cmd = f"""
+    c:\\ffmpeg\\bin\\ffmpeg -y -v error -progress pipe:1 -i "{video_input_file}" \
+    -vf subtitles='{new_srt_outputFileName}' -c:v libx264 -c:a copy "{video_output_file}"
+    """.strip()
+
+    print(f"🔹 Running: {ffmpeg_cmd}")  # Debugging log
+
+    result = run_ffmpeg_with_progress(ffmpeg_cmd, video_input_file)  # 🚀 Uses existing logic
+
+    if result == 0:
+        print(f"{now()} ✅ Successfully burned subtitles into {video_output_file}")
+    else:
+        print(f"{now()} ❌ FFmpeg failed with error code {result}")
+else:
+    print(f"{now()} ⏩ Skipping subtitle embedding, file exists: {video_output_file}")
+
+
+# ✅ Step 7: Convert to WeChat Compatible Format
+if not os.path.exists(video_small_outputFileName):
+    print(f"\n\n{now()}: reducing file size {video_output_file}\n")
+
+    ffmpeg_cmd = f"c:\\ffmpeg\\bin\\ffmpeg -y -i \"{video_output_file}\" -vf scale=960:540 -c:v libx264 -crf 23 -preset fast -b:v 1000k -c:a aac -b:a 128k \"{video_small_outputFileName}\""
+
+    print(f"🔹 Running: {ffmpeg_cmd}")  # Debugging log
+    os.system(ffmpeg_cmd)
+
+    if os.path.exists(video_small_outputFileName):
+        print(f"{now()} ✅ Successfully optimized video for WeChat: {video_small_outputFileName}")
+    else:
+        print(f"{now()} ❌ WeChat video optimization failed.")
+else:
+    print(f"{now()} ⏩ Skipping WeChat optimization, file exists: {video_small_outputFileName}")
+
 
 print(f"{now()} ✅ All steps complete!")
